@@ -335,10 +335,23 @@ WPA3 需要 hostapd 的 `CONFIG_SAE`——三个 TLS 变体都带（`hostapd/Mak
 
 ### 5.5 其他坑
 
-1. **ASPM/掉线**：`mt7921e` 有 `disable_aspm` 模块参数（mt76@0936617 `mt7921/pci.c`）；
-   实机若出现频繁掉线/扫描异常，可加模块选项 `options mt7921e disable_aspm=1`
-   （`/etc/modules.d/`，不在本任务写权限内）或在 GRUB 加 `pcie_aspm=off`
-   （`CONFIG_GRUB_BOOTOPTS`，`config/Config-images.in:268-272`）。
+0. **实测：AP+STA 并发会把固件搞挂（x86 + MT7922，本仓库镜像实机验证）**。
+   即使 AP 与上游同信道/同带宽、WPA2-PSK 正确（驱动 `valid interface combinations`
+   允许的 SCC 组合），只要拉起 STA 接口就出现
+   `Message 00020003 timeout` → `Failed to get patch semaphore` → `chip reset failed`
+   无限循环；AP 退化成 `Channel: 0`、`iwinfo`/`station dump` 超时导致 LuCI 卡死。
+   **只有物理断电 20 秒能恢复**（`reboot` 后变成 `driver own failed`；
+   PCI `remove`+`rescan`、`rmmod` 均无效或被卡住）。
+   结论：这块卡只能「纯 AP」或「纯 STA」，要中继得加第二张网卡。
+   完整记录与恢复步骤见 [`mt7922-wifi-relay.md`](mt7922-wifi-relay.md)。
+1. **ASPM/掉线**：`mt7921e` 有 `disable_aspm` 模块参数（mt76@0936617 `mt7921/pci.c`），
+   但**实测在 OpenWrt 的 kmodloader 下写 `/etc/modules.d/` 不生效**（参数仍为 `N`）。
+   正确做法：GRUB 加 `pcie_aspm.policy=performance`（本仓库 `.config` 已设
+   `CONFIG_GRUB_BOOTOPTS`），或运行时用
+   `setpci -s <BDF> CAP_EXP+10.w` 清掉链路 ASPM 位。
+   注意 **`pcie_aspm=off` 不等于关闭 ASPM**：它只是让内核不去改 BIOS 已开启的 ASPM，
+   `lspci -vv` 仍显示 `ASPM L0s L1 Enabled`，且此时写
+   `/sys/module/pcie_aspm/parameters/policy` 会返回 `EPERM`。
    外部讨论见文末 linux-wireless 邮件列表。
 2. **名字显示**：MT7922 (`14c3:0616`) 不在 `wifi_devices.json` PCI 名表
    （`wifi-scripts/files-ucode/usr/share/wifi_devices.json:182-194`），

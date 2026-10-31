@@ -1,218 +1,169 @@
-# MT7922 单卡「AP + 连别人家 Wi-Fi（中继）」为什么会卡 & 怎么修
+# MT7922 单卡做「AP + 连别人家 Wi-Fi（中继）」：实测结论与崩溃恢复
 
-> 症状对照：**无线 → 无线概况**里给 `radio0` 加了「客户端（Client / STA）」去连家里的
-> `Xiaomi_LYN_5G`，之后出现 ①「已连接站点」永远空、② LuCI 管理网页卡到几乎打不开、
-> ③ 客户端状态显示「无线未关联」。
+> 本文基于 **x86 / R86S（MT7922, `14c3:0616`）+ 本仓库固件（内核 6.18.55，mt76 2026.10.28）**
+> 的实机实测，不是推测。
 >
-> 这不是固件编坏了，是 **MT7922 只有一套射频**这个硬约束 + 你的配置把 AP 钉死在了 ch48。
+> **一句话结论：这块卡在本驱动/固件版本下不能做 AP+STA 中继。**
+> 一旦把第二个（STA）接口拉起来，MT7922 的 MCU 立刻挂死，只能**物理断电**才救得回来。
+> 想「盒子发 Wi-Fi」，请走有线 WAN；想「盒子自己上网」，请只用 STA 模式；两个都要，加第二张网卡。
 
 ---
 
-## 0. 三句话结论
+## 1. 实测记录（可复现）
 
-1. MT7922（mt7921e 驱动）**同一时刻只能待在一个信道上**。AP 和 STA 想同时工作，就必须
-   **同频段、同信道、（同或更窄）带宽**；跨信道并发被驱动直接禁掉了。
-2. 你把 `radio0` 钉在 **5GHz / ch48 / 80MHz**，而家里的 `Xiaomi_LYN_5G` 只要不在 ch48
-   （或者带宽不同），STA 就**永远关联不上**（截图正是「无线未关联」）。后果是 wpa_supplicant
-   不停扫描重试，射频一直被「借去」扫描 → AP 的 beacon 发不出去 → **客户端掉线、站点列表空、
-   LuCI 无线页面卡住**。
-3. 想要稳：**有线做 WAN、MT7922 只做 AP**。非要无线中继，就把 radio 的信道/带宽改成和上游
-   **一模一样**，并把本机 LAN 网段改掉（避免与家里路由器撞网段）。
+### 1.1 中继配置本身是"合规"的
 
----
+| 项 | 值 |
+| --- | --- |
+| 上游 `Xiaomi_LYN_5G` | **ch40（5200 MHz）/ 80 MHz / WPA2-PSK(AES)**，信号 -60 dBm |
+| 本机 AP | ch40 / HE80 / center 42（与上游同信道同带宽） |
+| 本机 STA | `psk2` + 正确密码（同信道 SCC 组合） |
 
-## 1. 证据：驱动里写死的「单信道」限制
+按驱动上报的 `valid interface combinations`，这已经是唯一合法的 AP+STA 组合
+（`#{ managed,P2P-client }<=2, #{ AP }<=1, #channels<=1`），**配置没有任何问题**。
 
-本固件用的 mt76 是 `package/kernel/mt76` 的 **2026-10-28（`0936617d`）** 版本，
-`mt792x_core.c`（mt7921e / mt7922 共用）里有两套接口组合表：
+### 1.2 结果：拉起 STA 接口 → MCU 挂死
 
-| 表 | 内容 | 含义 |
-| --- | --- | --- |
-| `if_comb`（固件无 CNM 能力时） | `{STATION}≤4`、`{AP}≤1`，`max_interfaces=4`，**`num_different_channels=1`** | 全局只能 1 个信道 |
-| `if_comb_chanctx_scc`（CNM 固件，同信道） | `{STATION,P2P-client}≤2`、`{AP}≤1`、`{P2P-device}≤1`，**`num_different_channels=1`** | 带 AP 的组合只允许 1 个信道 |
-| `if_comb_chanctx_mcc`（CNM 固件，跨信道） | `{STATION,P2P-client}≤2`、**`{P2P-GO}≤1`**、`{P2P-device}≤1`，`num_different_channels=2` | 允许 2 个信道，但**里面没有 AP**（只有 P2P-GO） |
-
-关键点：**所有包含 AP 的组合都是 `num_different_channels = 1`**。也就是说
-「AP 开在 5G ch48，同时 STA 连 2.4G 或另一个 5G 信道」在驱动层就被判定为非法组合，
-`mac80211` 会拒绝给这个 vif 分配信道（`-EBUSY`），hostapd/wpa_supplicant 日志里能看到
-信道相关的失败。
-
-这不是 OpenWrt 的限制，是 MediaTek 2025-06 主动加进上游的补丁，理由写得很直白：
-
-> "Due to the lack of NoA (Notice of Absence) mechanism in SoftAP mode, it is
-> inappropriate to allow concurrent SoftAP and STA to operate on the different channels."
-> — Leon Yen / Ming Yen Hsieh, MediaTek,
-> [[PATCH] wifi: mt76: Limit the concurrent STA and SoftAP to operate on the same channel](https://lore.kernel.org/all/20250619112005.2071110-1-mingyen.hsieh@mediatek.com/)
-> （v2：[限同一信道](https://lore.kernel.org/linux-wireless/20250625073720.1385210-1-mingyen.hsieh@mediatek.com/T/#u)）
-
-翻译成人话：**软 AP 没法告诉它自己的客户端「我要离开这个信道一会」（NoA）**。
-所以一旦射频跑去服务 STA 另一个信道上的业务，AP 就只有「漏发 beacon / 丢帧」这一种结果 ——
-这正是你看到的现象。
-
-> ⚠️ 顺带纠正本文档旧版本里的一句错误建议：「2.4G 做 AP + 5G 做 STA 中继」在 MT7922 上
-> **做不到**（那是两个信道）。已经改掉。
-
----
-
-## 2. 为什么「已连接站点」会空、网页会卡
-
-- **「已连接站点」表只显示连到你 ImmortalWrt 自己 AP 的设备**。STA 连到小米路由器，
-  不会出现在这张表里（它属于「上游客户端」，只在 状态→概览/无线 的接口状态里能看到）。
-  所以空表可能只是「没有设备连你的 AP」。
-- 但只要你把 STA 接口**启用**且它连不上（或连不稳），`wpa_supplicant` 会不停扫描重试。
-  单射频上每次扫描都要**离开 AP 当前信道**去扫其他信道，这期间 AP 的 beacon 和客户端的数据
-  都被延迟/丢弃 → 手机/电脑掉线重连、`iw station dump` 拿不到数据 → LuCI 的无线页
-  （它要靠 ubus 查站点列表）就卡在那儿。**「卡」和「站点表空」是同一个原因的两个表现。**
-- 另一个独立嫌疑：**网段冲突**。如果家里小米路由器的 LAN 也是 `192.168.1.0/24`，
-  而本机 lan 是 `192.168.1.1`，STA 一连上就会拿到 `192.168.1.x` 的地址 →
-  同网段两台 192.168.1.1 → ARP 混乱 → **不管有线无线都卡**。这条必须单独排掉。
-
----
-
-## 3. 先做 3 个 1 分钟检查（LuCI 里就能做完）
-
-1. **看上游真实信道**：网络 → 无线 → 点 `radio0` 那一行的「**扫描**」，
-   在列表里找 `Xiaomi_LYN_5G`，记下它的 **信道** 和带宽（20/40/80/160MHz）。
-   再对比你 `radio0` 现在钉的 `48`。**只要不一样，中继就不可能成功。**
-2. **看是不是撞网段**：登录小米路由器管理页，看它的 LAN/网关地址。
-   如果是 `192.168.1.1`（和本机一样）→ 先把本机改成 `192.168.8.1`（见 4.2）。
-3. **看 AP 的加密**：截图里是 `WPA3 OWE`，意思是「**开放网络**（无密码，只做机会加密）」，
-   谁都能连。改成 `WPA2-PSK`（或 `WPA2/WPA3 混合`）并设密码。
-
----
-
-## 4. 方案
-
-### 4.1 方案 A（强烈推荐）：有线做 WAN，MT7922 只做 AP
-
-x86 主机最稳、也是唯一能跑满速的用法：网口 WAN 接光猫/主路由，MT7922 只负责放 Wi-Fi。
-
-```sh
-# 只做 5G AP，非 DFS 信道，HE80，WPA2
-uci set wireless.radio0.disabled='0'
-uci set wireless.radio0.band='5g'
-uci set wireless.radio0.channel='149'      # 36/40/44/48 或 149/153/157/161，别用 52-64/100-140(DFS)
-uci set wireless.radio0.htmode='HE80'      # 想要 160MHz 写 HE160（部分地区/信道不支持）
-uci set wireless.radio0.country='CN'       # 中国允许 36-64、149-165
-uci set wireless.radio0.txpower='20'
-
-# 节名先用 `uci show wireless` 确认（一般是 default_radio0）
-uci set wireless.default_radio0.ssid='ImmortalWrt-5G'
-uci set wireless.default_radio0.encryption='psk2'
-uci set wireless.default_radio0.key='换成你的密码'
-uci commit wireless
-wifi reload
+```
+netifd: wifi-scripts: Preparing interface: phy0-sta0
+wpa_supplicant: Failed to bring up device phy0-sta0: RTNETLINK answers: Operation timed out
+dmesg: mt7921e 0000:04:00.0: Message 00020000x (seq N) timeout
+dmesg: mt7921e 0000:04:00.0: Failed to get patch semaphore
+dmesg: mt7921e 0000:04:00.0: MCU is not ready for firmware download
+dmesg: mt7921e 0000:04:00.0: chip reset failed     （之后每 ~5s 循环一次，永不恢复）
 ```
 
-注意：
-- **单卡同一时刻只能一个频段做 AP**。想要 2.4G 也覆盖，只能把 radio 切到 2.4G（或加网卡/加 AP）。
-- 2.4G 做 AP 时同理：`band=2g`、`channel=6`、`htmode=HE40`。
+现象组合（用户视角）：
 
-### 4.2 方案 B：真要用这块卡做无线中继（AP + STA 同信道）
+1. **LuCI 管理页面变得极慢**——无线相关页面要读 `iwinfo`/`station dump`，每条都要等 MCU 超时；
+2. **「已连接站点」永远空**——AP 接口即使存在也没有真正在信道上（`iwinfo` 显示
+   `Channel: 0 (unknown)`），自然没有站点；
+3. 内核日志被 `Loading firmware patch ... Failed to get patch semaphore ... chip reset failed`
+   每 5 秒刷屏，`load average` 常驻 1.5~4；
+4. 反复 `wifi reload` 也没用，驱动自己救不回来。
 
-前提：**AP 的信道/带宽必须和上游完全一致**，而且本机 LAN 不能和家里撞网段。
+> 另一条更早的线索：`if_connecting` 失败前会出现 `Message 00020003 (seq 3) timeout`，
+> 也就是 MediaTek 上游补丁所说的「SoftAP 没有 NoA 机制、不允许跨信道」的那种崩法，
+> 但在本卡上**同信道也一样崩**，说明是这版固件对 AP+STA 并发本身支持不完整。
+
+---
+
+## 2. 崩溃后怎么救（重要，别瞎重启）
+
+| 手段 | 结果 |
+| --- | --- |
+| `wifi reload` / `wifi down`+`up` | ❌ 继续刷超时 |
+| `rmmod mt7921e` | ❌ **卡死在模块卸载**，接着整机重启也会卡在同一处 |
+| `reboot`（热重启） | ❌ 起来后变成 `mt7921e: driver own failed` + `probe failed with error -5`，**驱动连初始化都过不去** |
+| PCI `remove` + `rescan` 重新枚举 | ❌ 设备能重新枚举、BAR 重新分配，但仍是 `driver own failed` |
+| **物理断电（拔电源 / 按住电源键 10s 再上电）** | ✅ **唯一有效**。冷启动后 `ASIC revision: 79220010`、固件正常加载、AP 正常上信道 |
+
+结论：**MT7921/MT7922 的固件崩溃是"粘住"的，只有给芯片断电才能复位**；
+`reboot`、`sysrq b/o`（在驱动卡死时也会被 shutdown hook 挡住）都不行。
+
+如果需要远程让机器进入"可断电"状态，注意 `poweroff` 也可能被卡死的驱动钩子挡住，
+此时只能人工按电源键。
+
+---
+
+## 3. 顺手要做的硬化：关掉 PCIe ASPM
+
+MT7921/MT7922 在 **ASPM L0s/L1 开启**时非常容易出现
+`Failed to get patch semaphore` / `MCU is not ready` / `chip reset failed` 这类固件加载失败。
+本机 BIOS 默认把这条链路设成 `ASPM L0s L1 Enabled`。
+
+三种做法（推荐第 1 种，本仓库镜像已默认）：
+
+1. **内核启动参数 `pcie_aspm.policy=performance`**（= 关闭 ASPM）
+   本仓库 `configs/x86_64-mt7922-plus.config` 已设
+   `CONFIG_GRUB_BOOTOPTS="pcie_aspm.policy=performance"`。已装机的可手改：
+   ```sh
+   sed -i 's|rootwait|rootwait pcie_aspm.policy=performance|' /boot/grub/grub.cfg
+   ```
+   注意：**`pcie_aspm=off` 不等于关闭 ASPM**——它只是让内核"不去改" BIOS 已经开启的 ASPM，
+   `lspci -vv` 里仍然是 `ASPM L0s L1 Enabled`，需要在驱动 probe 前就生效才行。
+   （而且 `pcie_aspm=off` 时向 `/sys/module/pcie_aspm/parameters/policy` 写入会返回 `EPERM`。）
+2. **运行时清掉链路 ASPM 位**（立即生效，适合已开机的机器）：
+   ```sh
+   D=0000:04:00.0            # 用 lspci -nn | grep 14c3 确认
+   cur=$(setpci -s $D CAP_EXP+10.w)
+   setpci -s $D CAP_EXP+10.w=$(printf '%04x' $((0x$cur & 0xfffc)))
+   lspci -vv -s $D | grep LnkCtl:   # 应显示 ASPM Disabled
+   ```
+   放到 `/etc/rc.local` 里可以每次开机执行。
+3. `mt7921e` 的模块参数 `disable_aspm=1`：**实测在 OpenWrt 的 kmodloader 下写
+   `/etc/modules.d/` 不生效**（参数仍是 `N`），别在这上面浪费时间。
+
+---
+
+## 4. 那到底怎么配才对
+
+### 4.1 方案 A（推荐）：有线 WAN + MT7922 纯 AP
 
 ```sh
-# 0) 先停掉无线，避免边改边打架
-wifi down
-
-# 1) 改 LAN 网段（假设家里是 192.168.1.x；示例改成 192.168.8.1）
-uci set network.lan.ipaddr='192.168.8.1'
-uci commit network
-/etc/init.d/network restart
-#   ⚠️ 之后要用 http://192.168.8.1 访问 LuCI（旧地址会失效）
-
-# 2) 把 radio 的信道/带宽改成「上游一模一样」（例：上游是 5G ch44 / 80MHz）
+# 只做 5G AP（单卡同一时刻只能一个频段、一个 AP）
 uci set wireless.radio0.disabled='0'
 uci set wireless.radio0.band='5g'
-uci set wireless.radio0.channel='44'        # ← 必须是扫描看到的那个信道，不能写 auto 硬猜
-uci set wireless.radio0.htmode='HE80'       # ← 带宽要和上游一致或更窄
-uci set wireless.radio0.country='CN'        # 与上游国家码一致，避免 149+ 之类被判非法
+uci set wireless.radio0.channel='149'      # 36/40/44/48 或 149/153/157/161；别用 52-64/100-140(DFS)
+uci set wireless.radio0.htmode='HE80'
+uci set wireless.radio0.country='CN'
 
-# 3) 客户端（STA）接口：网络挂 wwan，别挂 lan（挂 lan 会把两个二层网桥在一起）
-uci set wireless.sta.ssid='Xiaomi_LYN_5G'
-uci set wireless.sta.mode='sta'
-uci set wireless.sta.network='wwan'
-uci set wireless.sta.key='家里WiFi的密码'
-uci set wireless.sta.encryption='psk2'      # 与上游一致（sae/psk2/sae-mixed 要对）
-
-# 4) AP 侧：和 STA 同信道（同一个 radio，自动就是同信道），加密别用 OWE
+# 节名用 `uci show wireless` 确认（一般是 default_radio0）
 uci set wireless.default_radio0.ssid='ImmortalWrt'
 uci set wireless.default_radio0.encryption='psk2'
 uci set wireless.default_radio0.key='换成你的密码'
-
-uci commit wireless
-wifi reload
+uci commit wireless && wifi reload
 ```
 
-中继模式还要确认：`wwan` 在 **wan 防火墙区**里（网络 → 防火墙 → 区域，把 `wwan` 拖进 `wan` 区域、
-开 masq），否则下游设备上不了网。
+`iwinfo` 里应看到 `Channel: 149 (5.745 GHz)`（不是 `Channel: 0`），
+`iw dev` 里应看到 `channel 149 (5745 MHz), width: 80 MHz`。
+选信道时和邻居错开：先 `iw dev phy0-ap0 scan` 看看别人用哪个，别和家里主路由同信道。
 
-**中继模式下别指望满速**：单射频同一信道里 AP 和 STA 抢同一份空口时间，实测一般只剩
-上游速率的 40–60%，延迟还会翻倍。这是硬件决定的，不是配置问题。
-
-### 4.3 方案 C：加一张网卡（唯一能「中继 + 满速 + 不卡」的办法）
-
-- 再插一张 USB 无线网卡（如 MT7921AU / RTL8812AU，需 `kmod-rtw88`/`kmod-88XXau`）或另一张 PCIe 卡；
-- 一张做 STA（连家里），一张做 AP（放 Wi-Fi），两张卡各自独立信道，互不干扰；
-- 本固件已带 `usb3` 与大部分无线框架（`mac80211`/`cfg80211`），加驱动包重编即可。
-
----
-
-## 5. 排错命令（SSH 里逐条跑，2 分钟定位）
+### 4.2 方案 B：只用 STA 模式（盒子自己上网，不做 AP）
 
 ```sh
-# ① 射频/接口现状：有没有 sta0，AP 在哪个信道
-iw dev
-iw dev wlan0 link                 # AP 接口（名字可能是 wlan0/phy0-ap0）
-iw dev phy0-sta0 link             # STA 接口：Not connected 就是没连上
-iwinfo                            # 各接口的信道/发射功率/关联状态
-
-# ② 驱动到底允许什么组合（把这段完整发我，能一锤定音）
-iw phy0 info | sed -n '/valid interface combinations/,/^[[:space:]]*$/p'
-iw reg get
-
-# ③ 失败原因：hostapd / wpa_supplicant / 内核
-logread | grep -iE 'hostapd|wpa_supplicant|wlan|sta' | tail -40
-dmesg | grep -iE 'mt7921|mt7922|firmware|timeout|EBUSY' | tail -30
-
-# ④ 是不是撞网段 / 路由打架
-ip -4 addr; ip route; ip neigh | head -20
-cat /etc/config/network | sed -n '1,60p'
-uci show wireless
+uci set wireless.default_radio0.disabled='1'     # 关掉 AP
+uci set wireless.radio0.channel='40'             # 上游信道（扫描确认）
+uci set wireless.radio0.htmode='HE80'
+uci set wireless.wifinet1.mode='sta'
+uci set wireless.wifinet1.network='wwan'
+uci set wireless.wifinet1.ssid='Xiaomi_LYN_5G'
+uci set wireless.wifinet1.encryption='psk2'      # 上游是 WPA2-PSK(AES) 就写 psk2
+uci set wireless.wifinet1.key='上游WiFi密码'
+uci set wireless.wifinet1.disabled='0'
+uci commit wireless && wifi reload
 ```
 
-判读表：
+单 vif 的 STA 是能稳定工作的；盒子通过 `wwan`（DHCP）拿到地址后，
+LAN 口接的设备就能上网（`wwan` 已在 `wan` 防火墙区、开了 masq）。
+但**盒子自己就不发 Wi-Fi 了**，无线覆盖靠家里主路由。
 
-| 现象 | 结论 | 处理 |
-| --- | --- | --- |
-| `iw dev phy0-sta0 link` → `Not connected` | STA 压根没连上 | 信道/带宽/国家码和上游对齐（4.2 第 2 步） |
-| `valid interface combinations` 里 `#channels <= 1` 且带 `#{ AP }` | 跨信道 AP+STA 不可能 | 只能同信道，或换方案 A/C |
-| `logread` 里 `Cannot start ... channel` / `-EBUSY` / `CSA` 反复 | 信道冲突，射频被拖走 | 同上 |
-| `dmesg` 里 `mt7921e ... timeout` / `fw` 报错 / 大量 `tx failed` | 驱动/固件在 AP+STA 并发下不稳 | GRUB 加 `pcie_aspm=off`；仍不行就放弃单卡中继 |
-| `ip -4 addr` 里 `br-lan` 是 192.168.1.1，`wwan` 也拿到 192.168.1.x | **撞网段** ← 网页卡的常见真凶 | 改 lan 网段（4.2 第 1 步） |
+### 4.3 方案 C：加第二张网卡
 
-### 用网线做一次对照实验（很重要）
-
-把电脑用**网线**接到这台 x86 主机，再访问 LuCI：
-
-- 网线也不卡 → 跟无线无关，查网段冲突 / CPU 占用（`top`）/ `dmesg`；
-- 网线很顺、只有 Wi-Fi 卡 → 就是单射频并发/扫描干扰，按方案 A/B/C 处理。
+- USB 无线网卡（`kmod-rtw88` / `kmod-88XXau` / `kmod-mt7921u` 等）或第二张 PCIe 卡；
+- 一张 STA 连家里、一张 AP 发 Wi-Fi，两条独立射频、独立信道，互不干扰；
+- 这是唯一能「无线中继 + 双频 + 满速」的硬件级解法。
 
 ---
 
-## 6. 一句话记住
+## 5. 相关参数速查
 
-**MT7922 是一块「单信道」的卡：要么当 AP，要么当 STA 中继，要么两者同信道一起凑合用。
-想让「家里的 Wi-Fi 稳定又全速」，就用网线做上行，把这块卡留给 AP。**
+| 项 | 值 |
+| --- | --- |
+| 用户态看到的接口 | `phy0-ap0`（AP）、`phy0-sta0`（STA） |
+| `iw dev phy0-ap0 info` | 正常应显示 `channel 149 (5745 MHz), width: 80 MHz` |
+| 驱动 `valid interface combinations` | `#{ managed,P2P-client }<=2, #{ AP }<=1, #{ P2P-device }<=1, total<=3, #channels<=1` |
+| 健康标志 | `ASIC revision: 79220010` + `WM Firmware Version` + 无 `chip reset failed` |
+| 挂死标志 | `Failed to get patch semaphore` / `MCU is not ready for firmware download` / `chip reset failed` / `iwinfo` 显示 `Channel: 0` |
+| 恢复 | **物理断电 20 秒再上电** |
 
 ---
 
-## 7. 参考
+## 6. 参考
 
-- MediaTek 上游补丁（restrict concurrent STA/SoftAP to the same channel）：
+- MediaTek 上游补丁（限制 SoftAP+STA 同信道）：
   <https://lore.kernel.org/all/20250619112005.2071110-1-mingyen.hsieh@mediatek.com/>
-- mt76 驱动源码（与本固件 `0936617d` 一致）：`mt792x_core.c` 的 `if_comb` / `if_comb_chanctx_*`
+- mt76 源码（与本固件 `0936617d` 一致）：
   <https://github.com/openwrt/mt76/blob/0936617dc529ff9da0385221d3fa6de732231177/mt792x_core.c>
-- 本仓库内的实证笔记：[`mt7922-notes.md`](mt7922-notes.md)（驱动/固件/wpad/6GHz 的源码级核实）
-- 完整使用说明：[`x86_64-mt7922-plus.md`](x86_64-mt7922-plus.md)
+- 本仓库实证笔记：[`mt7922-notes.md`](mt7922-notes.md) ·
+  完整使用说明：[`x86_64-mt7922-plus.md`](x86_64-mt7922-plus.md)
