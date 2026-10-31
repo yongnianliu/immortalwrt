@@ -20,8 +20,10 @@
    （`hostapd/Makefile:88-90,105-112`），而该符号由 mt76 依赖 `select` 自动置 y
    （`scripts/package-metadata.pl:160-221`），因此**选了 mt7921e 就等于给 wpad 打开了 6GHz 所需的 11ax**。
 4. **6GHz AP 的硬限制**：6G 只允许 WPA3-SAE / OWE（`wifi/iface.uc:12-27`）；
-   **驱动同一时刻只上报 1 个 AP 接口**（mt76@0936617 `mt792x_core.c` 的 `if_limits`/`if_comb`），
-   所以「2.4G+5G+6G 三个 AP 同时开」不可行，只能选一个频段做 AP（或 CNM 固件下 AP+STA 跨信道并发，需实机验证）。
+   **驱动同一时刻只上报 1 个 AP 接口、且含 AP 的接口组合只有 1 个信道**（mt76@0936617
+   `mt792x_core.c` 的 `if_limits`/`if_comb`/`if_comb_chanctx_*`），所以「2.4G+5G+6G 三个 AP
+   同时开」不可行；AP+STA 中继（CNM 固件）也只能**同信道**（MediaTek 2025-06 上游补丁
+   明确禁止跨信道 SoftAP+STA）。详见 [`mt7922-wifi-relay.md`](mt7922-wifi-relay.md)。
 5. **必须设 country**：自动生成的 6G 设备默认 country 为 `'00'`（世界域，6GHz 不可用）
    （`wifi-scripts/files/lib/wifi/mac80211.uc:103-105`），需在 LuCI 里改成允许 6GHz 的国家码。
 6. **镜像**：EFI + BIOS 默认都会生成；最终文件
@@ -320,7 +322,13 @@ WPA3 需要 hostapd 的 `CONFIG_SAE`——三个 TLS 变体都带（`hostapd/Mak
 
 - **同一时刻只能起 1 个 AP BSS**（因此“2.4G、5G、6G 各开一个 AP 同时工作”与驱动上报的
   interface combination 冲突；需要多频段同时 AP 时只能用多张卡/另一个 AP）。
-- CNM 固件下可 AP + STA 跨信道并发（差旅/中继场景），但仍是 1 个 AP。
+- **CNM 固件下 AP + STA 也只能同信道**：本仓库 mt76 版本（以及内核 6.18 的 in-tree mt76）
+  都已包含 MediaTek 2025-06 的上游补丁
+  “[Limit the concurrent STA and SoftAP to operate on the same channel](https://lore.kernel.org/all/20250619112005.2071110-1-mingyen.hsieh@mediatek.com/)”
+  （理由：SoftAP 没有 NoA 机制）。表现为 `if_limits_chanctx_mcc` 的跨信道组合里**只有 P2P-GO、
+  没有 AP**，`if_limits_chanctx_scc` 才有 AP 且 `num_different_channels=1`。
+  所以 **AP + STA 中继必须同频段同信道同带宽**，「2.4G AP + 5G STA」不可行。
+  实机排错见 [`mt7922-wifi-relay.md`](mt7922-wifi-relay.md)。
 - 单频段上的多 SSID（多个 wifi-iface 指向同一 device）也会受 AP 接口上限影响，
   **必须以实机 `iw phy` 输出的 “valid interface combinations” 为准**再决定能否多 SSID。
 - 外部经验佐证（x86 + MT7921E/MT7922 可开 AP，2.4/5/6GHz“或”）：见文末 right.com.cn 帖子。
