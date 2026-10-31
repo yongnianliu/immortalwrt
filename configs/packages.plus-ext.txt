@@ -1,0 +1,17 @@
+geo2txt
+luci-app-appfilter
+luci-app-lucky
+luci-app-momo
+luci-app-nikki
+luci-app-partexp
+luci-app-passwall2
+luci-app-qos-legacy
+luci-app-ssr-plus
+luci-app-store
+luci-app-wechatpush
+luci-i18n-lucky-zh-cn
+luci-lib-taskd
+luci-lib-xterm
+lucky
+mihomo
+taskd
